@@ -46,7 +46,7 @@ Create a fresh environment with `uv`:
 
 ```bash
 cd /path/to/submit_code
-uv sync
+uv sync --extra default --extra dps
 uv run python -c "import lm_saes; print(lm_saes.__file__)"
 uv run run-dps --help
 ```
@@ -58,7 +58,7 @@ If you do not use `uv`, create a Python 3.11 environment and install this
 directory as a package:
 
 ```bash
-pip install -e .
+pip install -e ".[default,dps]"
 python -c "import lm_saes; print(lm_saes.__file__)"
 python run_dps.py --help
 ```

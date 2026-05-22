@@ -11,7 +11,7 @@ jaxtyping
 pydantic
 pydantic-settings
 safetensors
-transformers
+transformers>=4.57.1,<5
 datasets
 huggingface-hub
 rich
@@ -26,6 +26,7 @@ tiktoken
 python-dotenv
 tomlkit
 typing-extensions
+typeguard
 more-itertools
 json-repair
 accelerate
