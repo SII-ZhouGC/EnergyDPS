@@ -1,0 +1,62 @@
+[project]
+name = "lm-saes"
+version = "2.0.0b3"
+description = "Minimal single-feature DPS image generation with the local lm_saes package."
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = [
+    "torch==2.8.0",
+    "torchvision>=0.22.1",
+    "transformer-lens",
+    "numpy<2.0.0",
+    "Pillow>=9.2.0",
+    "PyYAML>=6.0.2",
+    "tqdm>=4.64.1",
+    "scipy>=1.9.1",
+    "requests>=2.28.1",
+    "einops>=0.8.0",
+    "jaxtyping>=0.2.34",
+    "pydantic>=2.10.6",
+    "pydantic-settings>=2.7.1",
+    "safetensors>=0.4.5",
+    "transformers>=4.57.1",
+    "datasets>=3.0.2",
+    "huggingface-hub>=0.20.0",
+    "rich>=12.6.0",
+    "pymongo>=4.10.1",
+    "msgpack>=1.1.0",
+    "pandas>=2.2.3",
+    "matplotlib>=3.9.2",
+    "wandb>=0.18.5",
+    "plotly>=5.24.1",
+    "openai>=1.52.2",
+    "tiktoken>=0.8.0",
+    "python-dotenv>=1.0.1",
+    "tomlkit>=0.13.2",
+    "typing-extensions>=4.13.2",
+    "more-itertools>=10.7.0",
+    "json-repair>=0.44.1",
+    "accelerate>=0.23.0",
+    "beartype>=0.14.1",
+    "better-abc>=0.0.3",
+    "fancy-einsum>=0.0.3",
+    "sentencepiece",
+]
+
+[project.scripts]
+run-dps = "run_dps:main"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["run_dps"]
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["lm_saes*", "guided_diffusion*"]
+exclude = ["TransformerLens*"]
+
+[tool.uv.sources]
+transformer-lens = { path = "./TransformerLens", editable = true }

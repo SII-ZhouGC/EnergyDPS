@@ -1,0 +1,461 @@
+import warnings
+from functools import partial
+from typing import Any, Mapping, Optional, cast
+
+import json
+import torch
+import torch.distributed.tensor
+from einops import rearrange, repeat
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
+from tqdm import tqdm
+
+from lm_saes.abstract_sae import AbstractSparseAutoEncoder
+from lm_saes.activation.factory import ActivationFactory
+from lm_saes.analysis.post_analysis import get_post_analysis_processor
+from lm_saes.clt import CrossLayerTranscoder
+from lm_saes.config import FeatureAnalyzerConfig
+from lm_saes.crosscoder import CrossCoder
+from lm_saes.lorsa import LowRankSparseAttention
+from lm_saes.cnnsae import CNNSparseAutoEncoder
+from lm_saes.utils.discrete import KeyedDiscreteMapper
+from lm_saes.utils.distributed import DimMap, to_local
+from lm_saes.utils.misc import is_primary_rank
+from lm_saes.utils.tensor_dict import concat_dict_of_tensor, sort_dict_of_tensor
+
+
+class FeatureAnalyzer:
+    """Analyzes feature activations from a sparse autoencoder.
+
+    This class processes activation data from a sparse autoencoder to:
+    1. Track activation statistics like frequency and magnitude
+    2. Sample and store representative activations
+    3. Organize results by feature for analysis
+    """
+
+    def __init__(
+        self,
+        cfg: FeatureAnalyzerConfig,
+    ):
+        """Initialize the feature analyzer.
+
+        Args:
+            cfg: Analysis configuration specifying parameters like sample sizes and thresholds
+        """
+        self.cfg = cfg
+
+    def _process_batch(
+        self,
+        feature_acts: torch.Tensor,  # [batch_size, context_size, d_sae]
+        discrete_meta: Mapping[str, torch.Tensor],
+        sample_result: Mapping[str, Mapping[str, torch.Tensor] | None],
+        max_feature_acts: torch.Tensor,  # [d_sae]
+        device_mesh: DeviceMesh | None = None,
+        *,
+        sae_is_cnnsae: bool = False,
+        extra_batch_data: Mapping[str, torch.Tensor] | None = None,
+    ) -> Mapping[str, Mapping[str, torch.Tensor] | None]:
+        """Process a batch of activations to update sampling results.
+
+        For each subsample type:
+        1. Computes sampling weights if enabled
+        2. Filters activations based on configured thresholds
+        3. Updates running sample collections
+        4. Maintains top N samples by activation magnitude
+
+        Args:
+            feature_acts: Feature activation values for current batch
+            discrete_meta: Metadata tensors like dataset/context IDs
+            sample_result: Current sampling results to update
+            max_feature_acts: Maximum activation seen so far per feature
+            device_mesh: Device mesh to use for distributed operations
+        Returns:
+            Updated sampling results with new batch incorporated
+        """
+        # Compute exponential lottery ticket values for sampling if enabled
+        elt = feature_acts.clamp(min=0.0).max(dim=1).values
+
+        # Process each subsample type (e.g. top activations)
+        for name in self.cfg.subsamples.keys():
+            elt_cur = elt.clone()
+            # Filter samples: only keep (feature activation) above a proportion of running max.
+            # This also ensures completely non-activating features (max==0) don't store samples (elt stays -inf).
+            proportion = float(self.cfg.subsamples[name].get("proportion", 1.0))
+            thr = max_feature_acts.unsqueeze(0) * proportion
+            keep = elt_cur > thr
+            elt_cur = elt_cur.masked_fill(~keep, -torch.inf)
+
+            sample_result_cur = sample_result[name]
+
+            # CNNSAE 特例：为每个 feature 单独保留 top-k 样本，而不是全局共享一组样本
+            if sae_is_cnnsae and name == "top_activations":
+                k = min(self.cfg.subsamples[name]["n_samples"], elt_cur.shape[0])
+                if k == 0:
+                    continue
+
+                # elt_cur: [batch, d_sae] -> per-feature topk
+                top_vals, top_idx = torch.topk(elt_cur, k=k, dim=0)  # shapes: [k, d_sae]
+
+                # feature_acts: [batch, context, d_sae] -> 先转为 [batch, d_sae, context] 以按 batch 维聚合
+                feature_acts_perm = feature_acts.permute(0, 2, 1)  # [batch, d_sae, context]
+                idx_expanded = top_idx.unsqueeze(-1).expand(-1, -1, feature_acts_perm.shape[2])  # [k, d_sae, context]
+                feature_acts_top = torch.gather(feature_acts_perm, dim=0, index=idx_expanded)  # [k, d_sae, context]
+
+                # gather extra batch data (e.g., image-level scalars) with the same per-feature top-k
+                extra_top: dict[str, torch.Tensor] = {}
+                if extra_batch_data:
+                    for ek, ev in extra_batch_data.items():
+                        if ev.dim() < 2:
+                            raise ValueError(
+                                f"extra_batch_data[{ek!r}] must have dim>=2 with shape [batch, d_sae, ...], got {tuple(ev.shape)}"
+                            )
+                        # extra data should align with the *input batch* (not the top-k result)
+                        if ev.shape[0] != elt_cur.shape[0] or ev.shape[1] != elt_cur.shape[1]:
+                            raise ValueError(
+                                f"extra_batch_data[{ek!r}] must have shape [batch, d_sae, ...] matching "
+                                f"feature_acts batch/d_sae ({tuple(elt_cur.shape)}), got {tuple(ev.shape)}"
+                            )
+                        # ev shape: [batch, d_sae, ...] or [batch, d_sae]
+                        idx_view = top_idx.view(top_idx.shape + (1,) * (ev.dim() - 2))
+                        idx_expand = idx_view.expand(top_idx.shape + ev.shape[2:])
+                        extra_top[ek] = ev.gather(0, idx_expand)
+
+                # gather meta: 支持 1D（batch）或 2D（batch, d_sae）形状
+                discrete_meta_top: dict[str, torch.Tensor] = {}
+                for mk, mv in discrete_meta.items():
+                    if mv.dim() == 1:
+                        # mv: [batch] -> [k, d_sae]
+                        discrete_meta_top[mk] = mv[top_idx]
+                    else:
+                        # mv: [batch, ...] -> 按 batch 维 gather 后恢复形状
+                        flat = top_idx.reshape(-1)
+                        gathered = mv[flat].reshape(top_idx.shape + mv.shape[1:])
+                        discrete_meta_top[mk] = gathered
+                # 若已有历史样本，则与当前 batch 合并再取 per-feature top-k
+                if sample_result_cur is not None:
+                    elt_cat = torch.cat([sample_result_cur["elt"], top_vals], dim=0)  # [k_total, d_sae]
+                    k_keep = min(self.cfg.subsamples[name]["n_samples"], elt_cat.shape[0])
+                    top_vals_new, top_idx_cat = torch.topk(elt_cat, k=k_keep, dim=0)  # [k_keep, d_sae]
+
+                    def gather_cat(t: torch.Tensor) -> torch.Tensor:
+                        # t shape: [k_total, d_sae, ...] or [k_total, d_sae]
+                        if t.dim() == 2:
+                            return t.gather(0, top_idx_cat)
+                        idx = top_idx_cat
+                        for _ in range(t.dim() - 2):
+                            idx = idx.unsqueeze(-1)
+                        idx_exp = idx.expand([top_idx_cat.shape[0], top_idx_cat.shape[1], *t.shape[2:]])
+                        return t.gather(0, idx_exp)
+
+                    feature_acts_cat = torch.cat([sample_result_cur["feature_acts"], feature_acts_top], dim=0)
+                    feature_acts_new = gather_cat(feature_acts_cat)
+
+                    discrete_meta_top_new: dict[str, torch.Tensor] = {}
+                    for mk in discrete_meta_top:
+                        meta_cat = torch.cat([sample_result_cur[mk], discrete_meta_top[mk]], dim=0)
+                        discrete_meta_top_new[mk] = gather_cat(meta_cat)
+
+                    extra_top_new: dict[str, torch.Tensor] = {}
+                    for ek in extra_top:
+                        extra_cat = torch.cat([sample_result_cur[ek], extra_top[ek]], dim=0)
+                        extra_top_new[ek] = gather_cat(extra_cat)
+
+                    sample_result_cur = {
+                        "elt": top_vals_new,
+                        "feature_acts": feature_acts_new,
+                        **discrete_meta_top_new,
+                        **extra_top_new,
+                    }
+                else:
+                    sample_result_cur = {
+                        "elt": top_vals,
+                        "feature_acts": feature_acts_top,
+                        **discrete_meta_top,
+                        **extra_top,
+                    }
+
+                sample_result = {**sample_result, name: sample_result_cur}
+                continue
+
+            # Prepare batch data with proper dimensions
+            batch_data = {
+                "elt": elt_cur,
+                "feature_acts": rearrange(
+                    feature_acts,
+                    "batch_size context_size d_sae -> batch_size d_sae context_size",
+                ),
+                **discrete_meta,
+            }
+            if extra_batch_data:
+                for ek, ev in extra_batch_data.items():
+                    if ev.dim() < 2:
+                        raise ValueError(
+                            f"extra_batch_data[{ek!r}] must have dim>=2 with shape [batch, d_sae, ...], got {tuple(ev.shape)}"
+                        )
+                    if ev.shape[0] != elt_cur.shape[0] or ev.shape[1] != elt_cur.shape[1]:
+                        raise ValueError(
+                            f"extra_batch_data[{ek!r}] must have shape [batch, d_sae, ...] matching elt "
+                            f"({tuple(elt_cur.shape)}), got {tuple(ev.shape)}"
+                        )
+                batch_data.update(extra_batch_data)
+
+            # Initialize or update sample collection
+            if sample_result_cur is None:
+                sample_result_cur = batch_data
+            elif (
+                sample_result_cur["elt"].size(0) > 0
+                and (elt_cur.max(dim=0).values > sample_result_cur["elt"][-1]).any()
+            ):
+                sample_result_cur = concat_dict_of_tensor(
+                    cast(dict[str, torch.Tensor], sample_result_cur),
+                    batch_data,
+                )
+            else:  # Skip if all activations are below the threshold
+                continue
+
+            # Sort and keep top N samples
+            sample_result_cur = sort_dict_of_tensor(
+                sample_result_cur, sort_dim=0, sort_key="elt", descending=True, device_mesh=device_mesh
+            )
+            sample_result_cur = {
+                k: v[
+                    : min(self.cfg.subsamples[name]["n_samples"], (sample_result_cur["elt"] != -torch.inf).sum().item())
+                ]
+                for k, v in sample_result_cur.items()
+            }
+
+            # Update main sample result with current batch results out of place
+            sample_result = {**sample_result, name: sample_result_cur}
+
+        return sample_result
+
+    def compute_ignore_token_masks(
+        self, tokens: torch.Tensor, ignore_token_ids: Optional[list[int]] = None
+    ) -> torch.Tensor:
+        """Compute ignore token masks for the given tokens.
+
+        Args:
+            tokens: The tokens to compute the ignore token masks for
+            ignore_token_ids: The token IDs to ignore
+        """
+        if ignore_token_ids is None:
+            warnings.warn(
+                "ignore_token_ids are not provided. No tokens (including pad tokens) will be filtered out. If this is intentional, set ignore_token_ids explicitly to an empty list to avoid this warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+            ignore_token_ids = []
+        mask = torch.ones_like(tokens, dtype=torch.bool)
+        for token_id in ignore_token_ids:
+            mask &= tokens != token_id
+        return mask
+
+    def get_post_analysis_func(self, sae_type: str):
+        """Get the post-analysis processor for the given SAE type.
+
+        Args:
+            sae_type: The SAE type identifier
+
+        Returns:
+            The post-analysis processor instance
+        """
+        try:
+            return get_post_analysis_processor(sae_type)
+        except KeyError:
+            # Fallback to generic processor if no specific processor is registered
+            return get_post_analysis_processor("generic")
+
+    @torch.no_grad()
+    def analyze_chunk(
+        self,
+        activation_factory: ActivationFactory,
+        sae: AbstractSparseAutoEncoder,
+        device_mesh: DeviceMesh | None = None,
+        activation_factory_process_kwargs: dict[str, Any] = {},
+    ) -> list[dict[str, Any]]:
+        """Analyze feature activations for a chunk of the SAE.
+
+        Processes activation data to:
+        1. Track activation statistics
+        2. Sample representative activations
+        3. Organize results by feature
+
+        Args:
+            activation_factory: The activation factory to use
+            sae: The sparse autoencoder model
+            device_mesh: The device mesh to use
+            activation_factory_process_kwargs: Keyword arguments to pass to the activation factory's process method
+
+        Returns:
+            List of dictionaries containing per-feature analysis results:
+            - Activation counts and maximums
+            - Sampled activations with metadata
+        """
+        activation_stream = activation_factory.process(**activation_factory_process_kwargs)
+        n_tokens = n_analyzed_tokens = 0
+
+        # Progress tracking
+        pbar = tqdm(
+            total=self.cfg.total_analyzing_tokens,
+            desc="Analyzing SAE",
+            smoothing=0.01,
+            disable=not is_primary_rank(device_mesh),
+        )
+
+        if device_mesh is not None and device_mesh.mesh_dim_names is not None and "model" in device_mesh.mesh_dim_names:
+            d_sae_local = sae.cfg.d_sae // device_mesh["model"].size()
+        else:
+            d_sae_local = sae.cfg.d_sae
+
+        # Initialize tracking variables
+        sample_result = {k: None for k in self.cfg.subsamples.keys()}
+        if device_mesh is not None:
+            act_times = torch.distributed.tensor.zeros(
+                (sae.cfg.d_sae,),
+                dtype=torch.long,
+                device_mesh=device_mesh,
+                placements=DimMap({"model": 0}).placements(device_mesh),
+            )
+            max_feature_acts = torch.distributed.tensor.zeros(
+                (sae.cfg.d_sae,),
+                dtype=sae.cfg.dtype,
+                device_mesh=device_mesh,
+                placements=DimMap({"model": 0}).placements(device_mesh),
+            )
+            sum_feature_acts = torch.distributed.tensor.zeros(
+                (sae.cfg.d_sae,),
+                dtype=sae.cfg.dtype,
+                device_mesh=device_mesh,
+                placements=DimMap({"model": 0}).placements(device_mesh),
+            )
+        else:
+            act_times = torch.zeros((d_sae_local,), dtype=torch.long, device=sae.cfg.device)
+            max_feature_acts = torch.zeros((d_sae_local,), dtype=sae.cfg.dtype, device=sae.cfg.device)
+            sum_feature_acts = torch.zeros((d_sae_local,), dtype=sae.cfg.dtype, device=sae.cfg.device)
+        mapper = KeyedDiscreteMapper()
+
+        # TODO: Make a wrapper for CLT
+        if isinstance(sae, CrossLayerTranscoder):
+            sae.encode = partial(sae.encode_single_layer, layer=self.cfg.clt_layer)  # type: ignore
+            sae.prepare_input = partial(sae.prepare_input_single_layer, layer=self.cfg.clt_layer)  # type: ignore
+            sae.decoder_norm_per_feature = partial(sae.decoder_norm_per_feature, layer=self.cfg.clt_layer)  # type: ignore
+            sae.keep_only_decoders_for_layer_from(self.cfg.clt_layer)  # type: ignore
+            torch.cuda.empty_cache()
+
+        # Process activation batches
+        for batch in activation_stream:
+            # Reshape meta to zip outer dimensions to inner
+            meta = {k: [m[k] for m in batch["meta"]] for k in batch["meta"][0].keys()}
+
+            # Get feature activations from SAE
+            x, encoder_kwargs, _ = sae.prepare_input(batch)
+            tokens = batch["tokens"]
+            feature_acts: torch.Tensor = sae.encode(x, **encoder_kwargs)
+            # print(f"{feature_acts.shape=}")
+            if isinstance(feature_acts, DTensor):
+                assert device_mesh is not None, "Device mesh is required for DTensor feature activations"
+                if device_mesh is not feature_acts.device_mesh:
+                    feature_acts = DTensor.from_local(
+                        feature_acts.redistribute(
+                            placements=DimMap({"head": -1, "model": -1}).placements(feature_acts.device_mesh)
+                        ).to_local(),
+                        device_mesh,
+                        placements=DimMap({"model": -1}).placements(device_mesh),
+                    )
+                    # TODO: Remove this once redistributing across device meshes is supported
+                feature_acts = feature_acts.redistribute(placements=DimMap({"model": -1}).placements(device_mesh))
+                if not isinstance(tokens, DTensor):
+                    tokens = DTensor.from_local(tokens, device_mesh, placements=DimMap({}).placements(device_mesh))
+            if isinstance(sae, CrossCoder):
+                feature_acts = feature_acts.amax(dim=-2)
+            if isinstance(sae, LowRankSparseAttention) and sae.cfg.skip_bos:
+                feature_acts[:, 0, :] = 0
+            if not isinstance(sae, CNNSparseAutoEncoder):
+                assert feature_acts.shape == (tokens.shape[0], tokens.shape[1], sae.cfg.d_sae), (
+                    f"feature_acts.shape: {feature_acts.shape}, expected: {(tokens.shape[0], tokens.shape[1], sae.cfg.d_sae)}"
+                )
+
+            # Compute ignore token masks
+            if not isinstance(sae, CNNSparseAutoEncoder):
+                ignore_token_masks = self.compute_ignore_token_masks(tokens, self.cfg.ignore_token_ids)
+                feature_acts *= rearrange(ignore_token_masks, "batch_size n_ctx -> batch_size n_ctx 1")
+
+            # Update activation statistics
+            active_feature_count = feature_acts.gt(0.0).sum(dim=[0, 1])
+            act_times += active_feature_count
+            max_feature_acts = torch.max(max_feature_acts, feature_acts.max(dim=0).values.max(dim=0).values)
+            sum_feature_acts += feature_acts.clamp(min=0.0).sum(dim=[0, 1])
+
+            # Apply discrete mapper encoding only to string metadata, keep others as-is
+            discrete_meta = {}
+            for k, v in meta.items():
+                # 1) Pure string meta -> discrete encode
+                if all(isinstance(item, str) for item in v):
+                    discrete_meta[k] = torch.tensor(mapper.encode(k, v), device=sae.cfg.device, dtype=torch.int32)
+                    continue
+
+                # 2) Pure numeric / bool meta -> tensorize
+                if all(isinstance(item, (int, float, bool)) for item in v):
+                    discrete_meta[k] = torch.tensor(v, device=sae.cfg.device)
+                    continue
+
+                # 3) Fallback: complex meta (dict/list/None/objects) -> json string encode
+                def to_str(x: Any) -> str:
+                    if isinstance(x, str):
+                        return x
+                    try:
+                        return json.dumps(x, sort_keys=True, ensure_ascii=False, default=str)
+                    except Exception:
+                        return str(x)
+
+                v_str = [to_str(item) for item in v]
+                discrete_meta[k] = torch.tensor(mapper.encode(k, v_str), device=sae.cfg.device, dtype=torch.int32)
+            if device_mesh is not None:
+                discrete_meta = {
+                    k: DTensor.from_local(
+                        local_tensor=repeat(v, "batch_size -> batch_size d_sae", d_sae=d_sae_local),
+                        device_mesh=device_mesh,
+                        placements=DimMap({"model": 1}).placements(device_mesh),
+                    )
+                    for k, v in discrete_meta.items()
+                }
+            sample_result = self._process_batch(
+                feature_acts,
+                discrete_meta,
+                sample_result,
+                max_feature_acts,
+                device_mesh,
+                sae_is_cnnsae=isinstance(sae, CNNSparseAutoEncoder),
+            )
+
+            # Update progress
+            n_tokens_current = tokens.numel()
+            n_tokens += n_tokens_current
+            if not isinstance(sae, CNNSparseAutoEncoder):
+                n_analyzed_tokens += cast(int, ignore_token_masks.int().sum().item())
+            else:
+                n_analyzed_tokens += n_tokens_current
+            pbar.update(n_tokens_current)
+            if n_tokens >= self.cfg.total_analyzing_tokens:
+                break
+
+        pbar.close()
+
+        # Filter out None values and format final per-feature results
+        sample_result = {k: v for k, v in sample_result.items() if v is not None}
+        sample_result = {
+            name: {k: to_local(v) for k, v in subsample.items()} for name, subsample in sample_result.items()
+        }
+
+        return self.get_post_analysis_func(sae.cfg.sae_type).process(
+            sae=sae,
+            act_times=to_local(act_times),
+            n_analyzed_tokens=n_analyzed_tokens,
+            max_feature_acts=to_local(max_feature_acts),
+            sum_feature_acts=to_local(sum_feature_acts),
+            sample_result=sample_result,
+            mapper=mapper,
+            device_mesh=device_mesh,
+            activation_factory=activation_factory,
+            activation_factory_process_kwargs=activation_factory_process_kwargs,
+        )
