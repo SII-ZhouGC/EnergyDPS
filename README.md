@@ -1,24 +1,25 @@
-# Minimal DPS CNNSAE Feature Visualization
+# A Distributional View for Visual Mechanistic Interpretability: KL-Minimal Soft-Constraint Principle
 
-This directory contains only the code needed to generate one image with DPS
-activation maximization for a single CNN-SAE feature.
+This directory contains the official implementaiton of "A Distributional View for Visual Mechanistic Interpretability: KL-Minimal Soft-Constraint Principle" in ICML 2026 spotlight. You can read the paper from the [link](https://arxiv.org/abs/2605.17504).
+
+This directory contains the code needed to generate one image with EnergyDPS activation maximization for a single CNN-SAE feature.
 
 It does not include model weights. Provide these paths at runtime:
 
-- ImageNet256 diffusion checkpoint, for example `imagenet256.pt`
-- DINOv3 ConvNeXt-Large checkpoint
-- CNN-SAE checkpoint directory
+- ImageNet256 diffusion checkpoint `imagenet256.pt` from the [link](https://drive.google.com/drive/folders/1jElnRoFv7b31fG0v6pTSQkelbSX3xGZh).
+- DINOv3 ConvNeXt-Large checkpoint `dinov3_convnext_large.pth` from the [link](https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/).
+- CNN-SAE checkpoint directory from the [link](https://huggingface.co/SII-ZhouGC/cnnsae_dinov3_resnext_large/tree/main).
 
 ## Run
 
 ```bash
 python run_dps.py \
-  --feature_idx 9863 \
+  --feature_idx 81 \
   --cap_value 20.0 \
   --sae_path /path/to/cnnsae_checkpoint \
   --dino_ckpt_path /path/to/dinov3_convnext_large.pth \
   --diffusion_model_path /path/to/imagenet256.pt \
-  --output_path outputs/feature_9863_dps.png
+  --output_path outputs/feature_81_dps.png
 ```
 
 The script writes the generated PNG to `--output_path` and prints the final
